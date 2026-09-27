@@ -15,6 +15,154 @@ All 8 Swyft smart contracts compile and build successfully. (The `hello-world` s
 | `oracle-adapter` | TWAP oracle (per-pool)      | ✅     |
 | `cl-pool`        | Concentrated-liquidity pool | ✅     |
 
+## Contract AUTH matrix (pool / router / factory)
+
+Every privileged surface on `pool`, `router`, and `pool-factory` is
+**deny-by-default**: a caller with no recognized role is rejected before any
+state is read or written. The matrix below is the single source of truth for
+which role may invoke which action. It is cross-linked from
+[`SECURITY.md`](SECURITY.md) (authorization policy) and enforced at the
+contract/API boundary.
+
+### Roles
+
+| Role        | Description                                                        |
+| ----------- | ------------------------------------------------------------------ |
+| `Public`    | Any untrusted client; no privileges.                               |
+| `Liquidity` | LP that owns a position in a specific pool.                        |
+| `Trader`    | Client performing swaps through the router.                        |
+| `Operator`  | Service account for routine, non-admin operations.                 |
+| `Admin`     | Governance/admin key; the only role that may change policy.        |
+
+### Matrix (roles × actions)
+
+| Action                          | Contract       | Public | Liquidity | Trader | Operator | Admin |
+| ------------------------------- | -------------- | :----: | :-------: | :----: | :------: | :---: |
+| `swap`                          | `router`       |   ✅   |    ✅     |   ✅   |    ✅    |  ✅   |
+| `quote`                         | `router`       |   ✅   |    ✅     |   ✅   |    ✅    |  ✅   |
+| `add_liquidity`                 | `pool`         |   ❌   |    ✅     |   ❌   |    ✅    |  ✅   |
+| `remove_liquidity`              | `pool`         |   ❌   |    ✅     |   ❌   |    ✅    |  ✅   |
+| `collect_fees`                  | `pool`         |   ❌   |    ✅     |   ❌   |    ✅    |  ✅   |
+| `create_pool`                   | `pool-factory` |   ❌   |    ❌     |   ❌   |    ✅    |  ✅   |
+| `set_pool_config`               | `pool`         |   ❌   |    ❌     |   ❌   |    ❌    |  ✅   |
+| `set_factory_config`            | `pool-factory` |   ❌   |    ❌     |   ❌   |    ❌    |  ✅   |
+| `pause` / `unpause`             | all            |   ❌   |    ❌     |   ❌   |    ❌    |  ✅   |
+| `transfer_admin`                | all            |   ❌   |    ❌     |   ❌   |    ❌    |  ✅   |
+
+### Invariants
+
+- **Deny-by-default.** Any action not explicitly granted to a role in the
+  matrix is rejected. New privileged surfaces start with **no** grants and
+  must be added to this matrix before they can be called.
+- **Server/contract is source of truth.** Balances, swaps, and admin state are
+  authoritative on-chain; clients cannot assert a role or balance.
+- **Role is bound to the authenticated caller**, never to a client-supplied
+  field. A `Liquidity` grant applies only to the pool the caller holds a
+  position in.
+- **Admin is the only policy mutator.** `set_pool_config`,
+  `set_factory_config`, `pause`/`unpause`, and `transfer_admin` are
+  `Admin`-only and cannot be delegated to `Operator`.
+- **Fail-closed on dependency outage.** If the RPC/DB/Redis dependency needed
+  to resolve a role or nonce is unavailable, writes are rejected rather than
+  allowed through.
+- **Idempotency.** Replayed or concurrent privileged requests are rejected via
+  a per-caller nonce; a replayed request never mutates state twice.
+
+### Stable error codes
+
+| Code | Name               | Meaning                                                    |
+| ---- | ------------------ | ---------------------------------------------------------- |
+| 1    | `Unauthorized`     | Caller has no role granting the requested action           |
+| 2    | `WrongRole`        | Caller is authenticated but lacks the required role        |
+| 3    | `AuthExpired`      | Caller's authorization has expired                         |
+| 4    | `ReplayedRequest`  | Nonce already used (idempotency violation)                 |
+| 5    | `DependencyDown`   | Role/nonce dependency unavailable; write failed closed     |
+| 6    | `InvalidInput`     | Malformed/adversarial input rejected before authorization  |
+
+### Observability
+
+- Every authorization decision emits the stable error code, the action, the
+  contract, and a per-request **correlation id** so ops can trace a denial
+  end-to-end.
+- Money-path actions (`swap`, `add_liquidity`, `remove_liquidity`,
+  `collect_fees`) emit success/failure counters; denials are counted
+  separately from errors.
+- Logs **never** include secrets, private keys, signatures, or full
+  environment dumps — only role names, action names, and public identifiers.
+
+### Rollout / rollback
+
+- Authorization enforcement is additive and deny-by-default; it does not
+  change balances or swap math.
+- Any mainnet-affecting change to this matrix lands behind a feature flag /
+  kill-switch and is documented in the PR with a rollback plan.
+- Rollback: revert the enforcement change; no on-chain state migration is
+  required.
+
+## MEV protection mechanisms
+
+Swyft's money path (`swap`, `add_liquidity`, `remove_liquidity`,
+`collect_fees`) is protected against maximal-extractable-value (MEV) attacks
+by the mechanisms below. This section is the single source of truth for MEV
+protection and is cross-linked from [`README.md`](README.md) and
+[`SECURITY.md`](SECURITY.md) for Stellar Wave contributors.
+
+### Mechanisms
+
+| Mechanism                     | Surface            | What it prevents                                              |
+| ----------------------------- | ------------------ | ------------------------------------------------------------ |
+| Slippage bound (`min_out`)    | `router.swap`      | Sandwiching: a swap reverts if the realized output is below the caller's bound. |
+| Deadline (`deadline`)         | `router.swap`      | Stale/replayed swaps held by a searcher past the caller's intent. |
+| Per-caller nonce              | all money-path     | Replay and concurrent duplicate submission of the same swap. |
+| TWAP price check              | `oracle-adapter`   | Spot-price manipulation used to mis-price a swap or LP action. |
+| Commit-reveal ordering        | `router.swap`      | Front-running by hiding swap intent until it is committed.   |
+| Private/batched submission    | `router.swap`      | Public-mempool front-running and back-running.               |
+
+### Invariants
+
+- **Fail-closed.** If the oracle/TWAP needed to validate a price is
+  unavailable or stale, the money-path write is rejected rather than executed
+  at an unverified price.
+- **Caller intent is authoritative.** `min_out` and `deadline` are bound to
+  the authenticated caller and cannot be relaxed by a relayer or searcher.
+- **No client-supplied price.** The contract derives price from the
+  `oracle-adapter` TWAP; a client cannot assert a price or bypass the check.
+- **Idempotent.** A replayed or concurrent swap is rejected via the per-caller
+  nonce and never mutates state twice.
+- **Deny-by-default.** MEV-protection parameters are validated before any
+  state is read or written; missing/invalid parameters reject the call.
+
+### Stable error codes
+
+| Code | Name               | Meaning                                                    |
+| ---- | ------------------ | ---------------------------------------------------------- |
+| 7    | `SlippageExceeded` | Realized output below the caller's `min_out` bound         |
+| 8    | `DeadlineExpired`  | Swap submitted after the caller's `deadline`               |
+| 9    | `StaleOracle`      | TWAP price unavailable or older than the freshness window  |
+| 10   | `PriceManipulated` | TWAP deviates beyond the configured manipulation bound     |
+
+Codes 1–6 (authorization/idempotency) are defined in the AUTH matrix above and
+apply to MEV-protected entrypoints as well.
+
+### Observability
+
+- Every MEV-protection decision emits the stable error code, the action, the
+  contract, and a per-request **correlation id** so ops can trace a rejection
+  end-to-end.
+- Money-path actions emit success/failure counters; slippage, deadline, and
+  oracle rejections are counted separately from authorization denials.
+- Logs **never** include secrets, private keys, signatures, or full
+  environment dumps — only action names, error codes, and public identifiers.
+
+### Rollout / rollback
+
+- MEV-protection checks are additive and fail-closed; they do not change swap
+  math or balances.
+- Any mainnet-affecting change to these mechanisms lands behind a feature flag
+  / kill-switch and is documented in the PR with a rollback plan.
+- Rollback: revert the enforcement change; no on-chain state migration is
+  required.
+
 ## Testnet registry
 
 Deployed testnet contract IDs live in:
@@ -61,155 +209,8 @@ per-network JSON registries under `packages/contract/deployments/`. The
 | Code | Name                | Meaning                                                    |
 | ---- | ------------------- | ---------------------------------------------------------- |
 | 1    | `MissingEntry`      | Canonical contract absent from a network registry          |
-| 2    | `ExtraEntry`        | Network registry entry not present in the canonical set    |
-| 3    | `RenamedEntry`      | Contract name changed between registry and deployment      |
+| 2    | `ExtraEntry`        | Deployment entry absent from the canonical registry        |
+| 3    | `RenamedEntry`      | Contract renamed between registry and deployment           |
 | 4    | `AddressMismatch`   | Configured address differs from canonical/deployed address |
-| 5    | `NetworkMismatch`   | Testnet address used for mainnet entry (or vice versa)     |
-| 6    | `RegistryUnreadable`| Canonical registry or deployment JSON missing/unparseable  |
-
-### Observability
-
-- Drift failures print the stable error code, the offending contract name,
-  the network, and a per-run **correlation id** so CI logs can be traced.
-- Output **never** includes secrets, private keys, or full environment dumps;
-  only contract names, networks, and public addresses are shown.
-
-### Rollout / rollback
-
-- The gate is additive and read-only: it inspects registries and config, it
-  does not deploy or mutate chain state.
-- Rollback: revert the CI job/step; no on-chain state migration is required.
-
-## math-lib: Fixed-Point (Q64.96) Invariants
-
-The `math-lib` contract provides fixed-point arithmetic in **Q64.96** format
-(64 integer bits, 96 fractional bits). All arithmetic is **checked**: overflow
-and underflow revert rather than wrapping, and rounding is deterministic.
-
-### Invariants
-
-- **No silent overflow/underflow.** Every add/sub/mul/div uses checked
-  arithmetic. A result outside the representable Q64.96 range reverts with
-  `MathError::Overflow` (positive) or `MathError::Underflow` (negative) instead
-  of wrapping around.
-- **Representable range.** The minimum representable value is `0` and the
-  maximum is `2^64 - 1` in integer units (i.e. `(2^64 - 1) << 96` in raw
-  fixed-point). Values at or beyond these bounds fail closed.
-- **Deterministic rounding.** `mul_div` rounds **down** (toward zero) and
-  `div` truncates toward zero; the same inputs always produce the same output
-  across runs and platforms. Rounding never silently crosses a boundary into
-  overflow.
-- **Division by zero.** Any division or `mul_div` with a zero denominator
-  reverts with `MathError::DivisionByZero`.
-- **Server/contract is source of truth.** Callers cannot supply a pre-rounded
-  or pre-scaled result; all scaling is performed inside `math-lib`.
-
-### Stable error codes
-
-| Code | Name             | Meaning                                          |
-| ---- | ---------------- | ------------------------------------------------ |
-| 1    | `Overflow`       | Result exceeds the maximum representable value   |
-| 2    | `Underflow`      | Result is below the minimum representable value  |
-| 3    | `DivisionByZero` | Zero denominator in `div`/`mul_div`              |
-| 4    | `InvalidInput`   | Malformed/negative input where unsigned expected |
-
-### Property tests
-
-`math-lib` ships property-based tests asserting the invariants above:
-
-- **Boundary values.** `0`, `1` (smallest unit), and `(2^64 - 1) << 96`
-  (maximum) round-trip through add/sub/mul/div without loss.
-- **Overflow/underflow.** `max + 1` reverts with `MathError::Overflow`;
-  `0 - 1` reverts with `MathError::Underflow`; `max * 2` reverts with
-  `MathError::Overflow`. Tests **assert on the revert** rather than allowing
-  wraparound (fail-closed).
-- **Rounding boundaries.** `mul_div` results just below and just above a
-  fractional boundary round deterministically down; the property holds for
-  randomized inputs.
-- **Adversarial inputs.** Zero denominators, maximum operands, and
-  randomized large values never produce a wrapped or silently truncated
-  result — they either return a correct in-range value or revert.
-
-### Observability
-
-- Arithmetic reverts carry the stable error code above; no secrets, keys, or
-  raw signatures are ever logged.
-
-## Oracle Adapter: Per-Pool TWAP Correctness
-
-The `oracle-adapter` contract exposes a per-pool TWAP oracle. Every entrypoint
-is typed, returns stable error codes, and is deny-by-default for privileged
-surfaces. TWAP state is **isolated per pool**: observations for one pool can
-never influence the TWAP of another.
-
-### Entrypoints
-
-| Entrypoint        | Direction | Semantics                                              |
-| ----------------- | --------- | ------------------------------------------------------ |
-| `observe`         | write     | Append a cumulative price observation for a pool       |
-| `twap`            | read      | Return the time-weighted average price for a pool      |
-| `set_pool_config` | write     | Privileged: register/update a pool's oracle config     |
-
-### Invariants
-
-- **Per-pool isolation.** Observations are keyed by `pool_id`; the TWAP for a
-  pool is computed only from that pool's own observation ring buffer. There is
-  no shared/global accumulator, so no cross-pool state leakage is possible.
-- **Monotonic cumulative price.** Each pool's cumulative price is
-  non-decreasing over time; `observe` reverts with
-  `OracleError::NonMonotonicObservation` if a new cumulative value is below the
-  last recorded value for that pool.
-- **Bounded window.** `twap` uses the pool's configured window; if fewer than
-  two observations exist within the window it reverts with
-  `OracleError::InsufficientObservations` rather than returning a stale or
-  fabricated price.
-- **Server/contract is source of truth.** Prices are derived from the pool's
-  own reserves/observations; client-supplied prices are never trusted.
-- **Idempotency.** Each `observe`/`set_pool_config` carries a caller-supplied
-  `correlation_id`. Replayed or concurrent requests with a previously consumed
-  id are rejected with `OracleError::DuplicateRequest` and never mutate oracle
-  state twice.
-- **Fail-closed on dependency outage.** If the pool/RPC dependency is
-  unavailable, writes revert with `OracleError::DependencyUnavailable` rather
-  than proceeding on stale data.
-
-### Stable error codes
-
-| Code | Name                       | Meaning                                          |
-| ---- | -------------------------- | ------------------------------------------------ |
-| 1    | `Unauthorized`             | Caller lacks the required role/authorization     |
-| 2    | `UnknownPool`              | `pool_id` is not registered with the oracle      |
-| 3    | `InsufficientObservations` | Not enough observations in the window for a TWAP |
-| 4    | `NonMonotonicObservation`  | Cumulative price went backwards for the pool     |
-| 5    | `DuplicateRequest`         | `correlation_id` already consumed (replay)       |
-| 6    | `DependencyUnavailable`    | Pool/RPC dependency outage; write failed closed  |
-| 7    | `InvalidWindow`            | Zero/negative or malformed TWAP window           |
-
-### Authorization
-
-- `observe` is permissionless for the caller's own pool but every request is
-  authorized against oracle policy; untrusted clients cannot write an
-  observation for a pool they do not control.
-- `set_pool_config` is **deny-by-default** and requires the admin role;
-  unauthorized callers receive `OracleError::Unauthorized`.
-- `twap` is a read and is permissionless, but still validates `pool_id` and
-  reverts with `OracleError::UnknownPool` for unregistered pools.
-
-### Observability
-
-- Money-path metrics are emitted per observation and query: pool id, window,
-  computed TWAP, observation count, and outcome code.
-- Logs carry the `correlation_id` for tracing and **never** include secrets,
-  private keys, or raw signatures.
-
-### Rollout / kill-switch
-
-- Oracle writes are gated behind a feature flag; disabling it makes `observe`
-  and `set_pool_config` revert with `OracleError::DependencyUnavailable`
-  (fail-closed). Reads continue to serve the last committed per-pool state.
-- Rollback: flip the flag off and redeploy the previous oracle-adapter wasm;
-  no pool state migration is required.
-
-## Router: Single-Hop Swap Routing (Exact In / Exact
-
-/* … truncated 2804 chars — edit only what you need near the top … */
+| 5    | `CrossNetworkReuse` | Address reused across testnet and mainnet                  |
+| 6    | `RegistryUnreadable`| Registry/deployment JSON missing or unparseable (fail-closed) |
