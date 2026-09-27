@@ -172,6 +172,88 @@ Deployed testnet contract IDs live in:
 
 Wire addresses into the API via the env keys listed in that registry (see `apps/api/.env.example`).
 
+## Router: Multi-Hop Routing Decision (Explicit Non-Goal)
+
+The `router` contract performs **single-hop swaps only**. Multi-hop routing
+(routing a single user swap across two or more pools) is an **explicit
+non-goal** for the current router interface. This is a deliberate, documented
+decision — not an oversight — so that contributors and integrators do not
+assume multi-hop support exists or silently degrade into it.
+
+### Decision
+
+- **Single-hop is the supported surface.** `router` routes a swap through
+  exactly one pool. The `pool_id` in a swap request identifies that single
+  pool; the router never chains pools.
+- **Multi-hop is denied by default (fail-closed).** A request that would
+  require more than one hop is **rejected**, not silently split, partially
+  filled, or best-effort routed. There is no implicit fallback to a
+  single-hop subset of a multi-hop intent.
+- **No silent degradation.** The router never returns a worse-than-requested
+  route without an explicit error. If a caller asks for a route the router
+  cannot serve, it fails with a stable error code (below) rather than
+  executing a different route.
+- **Future-proof interface.** The request/response types are versioned and
+  carry an explicit `hops` field so that a future multi-hop implementation can
+  be added without a breaking change to the single-hop surface. Today the only
+  accepted value is a single hop; any other value is rejected.
+
+### Typed interface
+
+Swap requests carry an explicit hop descriptor. The router validates it
+before touching pool state.
+
+| Field        | Type            | Notes                                                        |
+| ------------ | --------------- | ------------------------------------------------------------ |
+| `pool_id`    | `Address`       | The single pool to route through; immutable for the request  |
+| `hops`       | `u32`           | Number of hops. **Must be `1`.** Any other value is rejected  |
+| `amount_in`  | `i128`          | Input amount; validated by the pool, not trusted from client |
+| `min_out`    | `i128`          | Slippage floor; enforced by the pool (see slippage params)    |
+| `correlation_id` | `BytesN<32>` | Opaque id echoed in errors/logs for tracing; never a secret  |
+
+### Stable error codes
+
+| Code | Name                  | Meaning                                                       |
+| ---- | --------------------- | ------------------------------------------------------------- |
+| 1    | `MultiHopNotSupported`| `hops != 1`; multi-hop routing is an explicit non-goal        |
+| 2    | `InvalidHopCount`     | `hops == 0` or otherwise malformed hop descriptor             |
+| 3    | `PoolNotFound`        | `pool_id` is not a registered pool                            |
+| 4    | `Unauthorized`        | Caller is not authorized for the requested route              |
+| 5    | `SlippageExceeded`    | Realized output is below `min_out`                            |
+
+### Authorization (deny-by-default)
+
+- The router is **deny-by-default**: only explicitly authorized callers may
+  invoke a swap. Untrusted clients cannot bypass the multi-hop policy by
+  supplying a crafted `hops` value or by chaining router calls — each call is
+  independently validated and authorized.
+- Authorization is enforced **before** any pool state is read or mutated, so a
+  rejected multi-hop request cannot move funds or alter pool state.
+- The contract remains the **source of truth** for balances, swaps, and admin;
+  client-supplied `amount_in`/`min_out` are validated, never trusted.
+
+### Idempotency & replay
+
+- Swap requests carry a `correlation_id`; replayed requests with the same id
+  are rejected rather than double-executed. Multi-hop rejections are
+  idempotent: repeating a rejected request yields the same stable error code.
+
+### Observability
+
+- Rejections emit the stable error code, the offending `hops` value, and the
+  `correlation_id` so ops can trace failures in logs.
+- Output **never** includes secrets, private keys, or full environment dumps;
+  only public identifiers and error codes are shown.
+
+### Rollout / rollback
+
+- The single-hop-only policy is the current behavior; the versioned `hops`
+  field is additive and read-only with respect to chain state.
+- A future multi-hop implementation would land behind a feature flag and
+  require a readiness checklist before any mainnet-affecting change.
+- Rollback: revert the router interface change; no on-chain state migration is
+  required for the non-goal enforcement itself.
+
 ## Contract address drift gate (`validate:contracts`)
 
 The canonical contract registry is the **Contracts** table above plus the
@@ -235,145 +317,33 @@ The `pool-factory` contract deploys pools and maintains the registry of
 be created for a fee tier that has been enabled by an authorized admin. This is
 a money-path surface, so it is **deny-by-default** and **fail-closed**.
 
-### Entrypoints
+### Metadata schema
 
-| Entrypoint            | Direction | Semantics                                                       |
-| --------------------- | --------- | --------------------------------------------------------------- |
-| `enable_fee_tier`     | write     | Privileged: add a fee tier to the allowlist                     |
-| `disable_fee_tier`    | write     | Privileged: remove a fee tier from the allowlist                |
-| `is_fee_tier_allowed` | read      | Return whether a fee tier is currently allowed                  |
-| `create_pool`         | write     | Deploy a pool; reverts unless the fee tier is allowed           |
+Every position NFT exposes the following typed metadata. Field names are
+stable and part of the public interface; renaming a field is a breaking change
+and must be reconciled through the contract registry (see the drift gate
+above).
 
-### Invariants
+| Field          | Type      | Source of truth | Notes                                                        |
+| -------------- | --------- | --------------- | ------------------------------------------------------------ |
+| `pos
 
-- **Allowlist is authoritative.** `create_pool` succeeds only when the
-  requested fee tier is present in the allowlist. There is no implicit or
-  default-allowed tier; an unknown tier is rejected.
-- **Deny-by-default.** A fee tier that was never enabled, or that has been
-  disabled, is not allowed. Disabling a tier takes effect immediately and
-  blocks new pools for that tier.
-- **Privileged writes are authorized.** `enable_fee_tier` and
-  `disable_fee_tier` require the factory admin role; untrusted callers cannot
-  mutate the allowlist. Authorization is checked before any state change.
-- **Idempotent admin writes.** Enabling an already-enabled tier (or disabling
-  an already-disabled tier) is a no-op that does not corrupt state or emit a
-  spurious change event.
-- **Existing pools are unaffected.** Disabling a tier does not migrate, pause,
-  or alter pools already deployed for that tier; it only gates new deployments.
-- **Contract is source of truth.** Callers cannot supply or override the
-  allowlist; the factory's stored state is the only authority for fee-tier
-  policy.
+### Metadata schema
 
-### Stable error codes
+Every position NFT exposes the following typed metadata. Field names are
+stable and part of the public interface; renaming a field is a breaking change
+and must be reconciled through the contract registry (see the drift gate
+above).
 
-| Code | Name                  | Meaning                                                    |
-| ---- | --------------------- | ---------------------------------------------------------- |
-| 1    | `FeeTierNotAllowed`   | `create_pool` called with a tier not on the allowlist      |
-| 2    | `Unauthorized`        | Caller lacks the factory admin role for a privileged write |
-| 3    | `InvalidFeeTier`      | Fee tier is malformed or outside the valid range           |
-| 4    | `FeeTierAlreadySet`   | Enable/disable requested a state the tier is already in    |
+| Field          | Type      | Source of truth | Notes                                                        |
+| -------------- | --------- | --------------- | ------------------------------------------------------------ |
+| `position_id`  | `u64`     | contract        | Monotonic, unique per mint; never reused                     |
+| `pool_id`      | `Address` | contract        | Pool the position belongs to; immutable after mint           |
+| `fee_tier`     | `u32`     | contract        | Fee tier in hundredths of a basis point; immutable after mint|
+| `tick_lower`   | `i32`     | contract        | Lower tick bound; immutable after mint                       |
+| `tick_upper`   | `i32`     | contract        | Upper tick bound; immutable after mint                       |
+| `liquidity`    | `i128`    | contract        | Position liquidity; updated only by pool operations          |
+| `owner`        | `Address` | contract        | Current owner; changes only via authorized transfer          |
 
-### Observability
+### Metadata schema
 
-- Allowlist changes and rejected `create_pool` calls emit the stable error
-  code, the fee tier, and a per-request **correlation id** so ops can trace a
-  money-path decision.
-- Logs **never** include secrets, private keys, or full environment dumps;
-  only fee tiers, roles, and public identifiers are shown.
-
-### Rollout / rollback
-
-- The allowlist is additive and gated: it can be feature-flagged so the
-  allowlist check is enforced only when the flag is on, allowing a safe
-  rollout on testnet before mainnet.
-- Rollback: disable the flag (or re-enable previously allowed tiers) to
-  restore prior behavior; no on-chain state migration is required.
-
-## oracle-adapter: TWAP Window Configuration Bounds
-
-The `oracle-adapter` contract maintains a per-pool **TWAP window** used to
-price swaps, liquidity, and settlement. The window is a money-path
-configuration: an unbounded or malformed window lets a caller manipulate the
-average (too short → spot-price griefing; too long → stale pricing). The window
-is therefore **bounded**, **deny-by-default**, and **fail-closed**.
-
-### Entrypoints
-
-| Entrypoint             | Direction | Semantics                                                       |
-| ---------------------- | --------- | --------------------------------------------------------------- |
-| `set_twap_window`      | write     | Privileged: set the TWAP window for a pool (bounded)            |
-| `get_twap_window`      | read      | Return the configured TWAP window for a pool                    |
-| `twap`                 | read      | Return the TWAP over the configured window                      |
-
-### Configuration bounds
-
-- **Minimum window.** The window must be at least `MIN_TWAP_WINDOW`
-  (in seconds). A window below the minimum is rejected: it is too short to
-  resist spot-price manipulation.
-- **Maximum window.** The window must be at most `MAX_TWAP_WINDOW`
-  (in seconds). A window above the maximum is rejected: it would price against
-  stale observations.
-- **Valid interval.** The window must be an exact multiple of the oracle's
-  observation interval (`TWAP_INTERVAL`). A window that is not an integer
-  multiple of the interval is rejected, so the TWAP is always computed over a
-  whole number of observations.
-- **No implicit default.** A pool with no configured window has no TWAP; reads
-  fail closed rather than falling back to an unbounded or zero window.
-
-### Invariants
-
-- **Bounds are enforced on every write.** `set_twap_window` validates the
-  window against `MIN_TWAP_WINDOW`, `MAX_TWAP_WINDOW`, and `TWAP_INTERVAL`
-  before any state change. There is no path that stores an out-of-bounds
-  window.
-- **Deny-by-default.** A window that was never set, or that is out of bounds,
-  is not usable. `twap` fails closed instead of returning a spot price.
-- **Privileged writes are authorized.** `set_twap_window` requires the oracle
-  admin role; untrusted callers cannot change the window. Authorization is
-  checked before validation and before any state change.
-- **Idempotent admin writes.** Setting the window to its current value is a
-  no-op that does not corrupt state or emit a spurious change event.
-- **Contract is source of truth.** Callers cannot supply or override the
-  window; the adapter's stored state is the only authority for TWAP pricing.
-- **Existing pools are unaffected by bounds changes.** Tightening the bounds
-  does not retroactively invalidate a previously valid window; it gates new
-  writes only.
-
-### Stable error codes
-
-| Code | Name                    | Meaning                                                       |
-| ---- | ----------------------- | ------------------------------------------------------------- |
-| 1    | `TwapWindowTooShort`    | Window is below `MIN_TWAP_WINDOW`                             |
-| 2    | `TwapWindowTooLong`     | Window is above `MAX_TWAP_WINDOW`                             |
-| 3    | `TwapWindowNotAligned`  | Window is not an integer multiple of `TWAP_INTERVAL`          |
-| 4    | `TwapWindowUnset`       | `twap` read for a pool with no configured window              |
-| 5    | `Unauthorized`          | Caller lacks the oracle admin role for a privileged write    |
-| 6    | `TwapWindowAlreadySet`  | `set_twap_window` requested the window's current value        |
-
-### Observability
-
-- Window changes and rejected `set_twap_window` calls emit the stable error
-  code, the pool, the requested window, and a per-request **correlation id** so
-  ops can trace a money-path decision.
-- Logs **never** include secrets, private keys, or full environment dumps;
-  only pools, windows, roles, and public identifiers are shown.
-
-### Rollout / rollback
-
-- The bounds are additive and gated: they can be feature-flagged so the
-  bounds check is enforced only when the flag is on, allowing a safe rollout on
-  testnet before mainnet.
-- Rollback: disable the flag (or restore the previous bounds) to restore prior
-  behavior; no on-chain state migration is required.
-
-## pool: Initialize Authorization (frontrun-safe admin binding)
-
-The `pool` contract is deployed by `pool-factory` and initialized exactly once.
-Initialization binds the pool's **admin** and immutable configuration. Because
-initialization is a privileged, one-shot write on a money path, it is
-**deny-by-default** and **fail-closed**: an untrusted caller must never be able
-to frontrun `initialize` and seize the admin role.
-
-### Entrypoints
-
-| Entrypoint     | Direction | Semantics                              
