@@ -111,6 +111,60 @@ export type TestnetRedeployAuthErrorCode =
   (typeof TESTNET_REDEPLOY_AUTH_ERRORS)[keyof typeof TESTNET_REDEPLOY_AUTH_ERRORS];
 
 /**
+ * Stable error codes for the factory fee-tier allowlist surface (#1022).
+ * Deny-by-default: any failure to prove the fee-tier admin role is rejected.
+ */
+export const FACTORY_FEE_TIER_AUTH_ERRORS = {
+  MISSING_KEY: 'FACTORY_FEE_TIER_AUTH_MISSING_KEY',
+  INVALID_KEY: 'FACTORY_FEE_TIER_AUTH_INVALID_KEY',
+  WRONG_ROLE: 'FACTORY_FEE_TIER_AUTH_WRONG_ROLE',
+  EXPIRED: 'FACTORY_FEE_TIER_AUTH_EXPIRED',
+  NOT_CONFIGURED: 'FACTORY_FEE_TIER_AUTH_NOT_CONFIGURED',
+  DISABLED: 'FACTORY_FEE_TIER_AUTH_DISABLED',
+} as const;
+
+export type FactoryFeeTierAuthErrorCode =
+  (typeof FACTORY_FEE_TIER_AUTH_ERRORS)[keyof typeof FACTORY_FEE_TIER_AUTH_ERRORS];
+
+/**
+ * Stable error codes for the pool-initialize auth surface (#1023).
+ * Deny-by-default: any failure to prove the pool-init admin role is rejected,
+ * so a frontrunner cannot race `initialize` to steal pool admin.
+ */
+export const POOL_INIT_AUTH_ERRORS = {
+  MISSING_KEY: 'POOL_INIT_AUTH_MISSING_KEY',
+  INVALID_KEY: 'POOL_INIT_AUTH_INVALID_KEY',
+  WRONG_ROLE: 'POOL_INIT_AUTH_WRONG_ROLE',
+  EXPIRED: 'POOL_INIT_AUTH_EXPIRED',
+  NOT_CONFIGURED: 'POOL_INIT_AUTH_NOT_CONFIGURED',
+  ALREADY_INITIALIZED: 'POOL_INIT_AUTH_ALREADY_INITIALIZED',
+  REPLAY_DETECTED: 'POOL_INIT_AUTH_REPLAY_DETECTED',
+  DEPENDENCY_UNAVAILABLE: 'POOL_INIT_AUTH_DEPENDENCY_UNAVAILABLE',
+} as const;
+
+export type PoolInitAuthErrorCode =
+  (typeof POOL_INIT_AUTH_ERRORS)[keyof typeof POOL_INIT_AUTH_ERRORS];
+
+/**
+ * Constant-time comparison that never throws on length mismatch.
+ */
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+/**
+ * Guard enforcing FEE_COLLECTOR_AUTH for fee-collector entrypoints.
+ *
+ * Invariants:
+ *  - Deny-by-default: missing/expired/wrong-role credentials are rejected.
+ *  - Fail-closed: if the expected key is not configured, all requests are denied.
+ *  - Rotation (#1030): the `_PREVIOUS` key is honoured only until its
+ *    `_PREVIOUS_EXPIRES_AT`; afterwards it is rejected with the EXPIRED code.
+ *  - No bypass: untrusted clients cannot satisfy the check without the key.
+ *  - Correlation id is su
  * Guard enforcing FEE_COLLECTOR_AUTH for fee-collector entrypoints.
  *
  * Invariants:
@@ -274,6 +328,144 @@ export class TestnetRedeployGuard implements CanActivate {
           correlationId,
         });
       }
+    }
+
+    return true;
+  }
+}
+
+/**
+ * Guard enforcing POOL_INIT_AUTH for pool `initialize` entrypoints (#1023).
+ *
+ * Invariants:
+ *  - Deny-by-default: missing/expired/wrong-role credentials are rejected, so
+ *    an untrusted frontrunner cannot race `initialize` to become pool admin.
+ *  - Fail-closed: if the expected key is not configured, all requests are denied.
+ *  - Idempotent/replay-safe: a per-pool init nonce is required and single-use;
+ *    concurrent or replayed initialize requests fail closed.
+ *  - Dependency fail-closed: if the replay store (Redis/DB) is unavailable the
+ *    write path is refused rather than allowed through.
+ *  - No bypass: untrusted clients cannot satisfy the check without the key.
+ *  - Correlation id is surfaced for ops without leaking the secret.
+ */
+@Injectable()
+export class PoolInitGuard implements CanActivate {
+  private readonly logger = new Logger(PoolInitGuard.name);
+
+  /**
+   * Single-use nonce store for pool-init replay protection. Injected/overridable
+   * so tests and ops can supply a Redis/DB-backed implementation. When unset,
+   * the guard fails closed (no privileged init without a replay store).
+   */
+  constructor(
+    private readonly replayStore?: {
+      /** Atomically claim a nonce; returns false if already used. */
+      claim(key: string): Promise<boolean>;
+    },
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const req = context.switchToHttp().getRequest<Request>();
+    const correlationId =
+      (req.headers['x-correlation-id'] as string | undefined) ??
+      (req.headers['x-request-id'] as string | undefined) ??
+      'unknown';
+
+    const expected = process.env.POOL_INIT_AUTH;
+    if (!expected) {
+      // Fail-closed: no configured secret means no privileged access.
+      throw new UnauthorizedException({
+        code: POOL_INIT_AUTH_ERRORS.NOT_CONFIGURED,
+        message: 'Pool init auth is not configured',
+        correlationId,
+      });
+    }
+
+    const key = req.headers['x-internal-key'] as string | undefined;
+    if (!key) {
+      throw new UnauthorizedException({
+        code: POOL_INIT_AUTH_ERRORS.MISSING_KEY,
+        message: 'Missing pool init credentials',
+        correlationId,
+      });
+    }
+
+    if (!safeEqual(key, expected)) {
+      throw new UnauthorizedException({
+        code: POOL_INIT_AUTH_ERRORS.INVALID_KEY,
+        message: 'Invalid pool init credentials',
+        correlationId,
+      });
+    }
+
+    // Optional role/expiry enforcement when the caller presents a scoped token.
+    const role = req.headers['x-pool-init-role'] as string | undefined;
+    if (role && role !== 'pool-init-admin') {
+      throw new ForbiddenException({
+        code: POOL_INIT_AUTH_ERRORS.WRONG_ROLE,
+        message: 'Caller lacks pool-init-admin role',
+        correlationId,
+      });
+    }
+
+    const expiresAt = req.headers['x-pool-init-expires-at'] as string | undefined;
+    if (expiresAt) {
+      const ts = Number(expiresAt);
+      if (!Number.isFinite(ts) || ts <= Date.now()) {
+        throw new UnauthorizedException({
+          code: POOL_INIT_AUTH_ERRORS.EXPIRED,
+          message: 'Pool init credentials expired',
+          correlationId,
+        });
+      }
+    }
+
+    // Idempotency/replay protection: require a single-use init nonce per pool.
+    const poolId =
+      (req.headers['x-pool-id'] as string | undefined) ??
+      (req.body?.poolId as string | undefined);
+    const nonce = req.headers['x-pool-init-nonce'] as string | undefined;
+    if (!poolId || !nonce) {
+      throw new ForbiddenException({
+        code: POOL_INIT_AUTH_ERRORS.REPLAY_DETECTED,
+        message: 'Pool init requires a pool id and single-use nonce',
+        correlationId,
+      });
+    }
+
+    if (!this.replayStore) {
+      // Fail-closed: without a replay store we cannot guarantee single-use.
+      throw new UnauthorizedException({
+        code: POOL_INIT_AUTH_ERRORS.DEPENDENCY_UNAVAILABLE,
+        message: 'Pool init replay store is unavailable',
+        correlationId,
+      });
+    }
+
+    let claimed: boolean;
+    try {
+      claimed = await this.replayStore.claim(`pool-init:${poolId}:${nonce}`);
+    } catch (err) {
+      // Dependency outage (Redis/DB): fail closed on the init write path.
+      this.logger.error(
+        `Pool init replay store error (correlationId=${correlationId}): ${
+          (err as Error)?.message ?? 'unknown'
+        }`,
+      );
+      throw new UnauthorizedException({
+        code: POOL_INIT_AUTH_ERRORS.DEPENDENCY_UNAVAILABLE,
+        message: 'Pool init replay store is unavailable',
+        correlationId,
+      });
+    }
+
+    if (!claimed) {
+      // Concurrent or replayed initialize request: reject, do not re-init.
+      throw new ForbiddenException({
+        code: POOL_INIT_AUTH_ERRORS.REPLAY_DETECTED,
+        message: 'Pool init nonce already used',
+        correlationId,
+      });
     }
 
     return true;

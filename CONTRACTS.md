@@ -214,3 +214,166 @@ per-network JSON registries under `packages/contract/deployments/`. The
 | 4    | `AddressMismatch`   | Configured address differs from canonical/deployed address |
 | 5    | `CrossNetworkReuse` | Address reused across testnet and mainnet                  |
 | 6    | `RegistryUnreadable`| Registry/deployment JSON missing or unparseable (fail-closed) |
+
+### Observability
+
+- Drift failures print the stable error code, the offending contract name,
+  the network, and a per-run **correlation id** so CI logs can be traced.
+- Output **never** includes secrets, private keys, or full environment dumps;
+  only contract names, networks, and public addresses are shown.
+
+### Rollout / rollback
+
+- The gate is additive and read-only: it inspects registries and config, it
+  does not deploy or mutate chain state.
+- Rollback: revert the CI job/step; no on-chain state migration is required.
+
+## pool-factory: Fee Tier Allowlist
+
+The `pool-factory` contract deploys pools and maintains the registry of
+**allowed fee tiers**. Fee tiers are an explicit **allowlist**: a pool can only
+be created for a fee tier that has been enabled by an authorized admin. This is
+a money-path surface, so it is **deny-by-default** and **fail-closed**.
+
+### Entrypoints
+
+| Entrypoint            | Direction | Semantics                                                       |
+| --------------------- | --------- | --------------------------------------------------------------- |
+| `enable_fee_tier`     | write     | Privileged: add a fee tier to the allowlist                     |
+| `disable_fee_tier`    | write     | Privileged: remove a fee tier from the allowlist                |
+| `is_fee_tier_allowed` | read      | Return whether a fee tier is currently allowed                  |
+| `create_pool`         | write     | Deploy a pool; reverts unless the fee tier is allowed           |
+
+### Invariants
+
+- **Allowlist is authoritative.** `create_pool` succeeds only when the
+  requested fee tier is present in the allowlist. There is no implicit or
+  default-allowed tier; an unknown tier is rejected.
+- **Deny-by-default.** A fee tier that was never enabled, or that has been
+  disabled, is not allowed. Disabling a tier takes effect immediately and
+  blocks new pools for that tier.
+- **Privileged writes are authorized.** `enable_fee_tier` and
+  `disable_fee_tier` require the factory admin role; untrusted callers cannot
+  mutate the allowlist. Authorization is checked before any state change.
+- **Idempotent admin writes.** Enabling an already-enabled tier (or disabling
+  an already-disabled tier) is a no-op that does not corrupt state or emit a
+  spurious change event.
+- **Existing pools are unaffected.** Disabling a tier does not migrate, pause,
+  or alter pools already deployed for that tier; it only gates new deployments.
+- **Contract is source of truth.** Callers cannot supply or override the
+  allowlist; the factory's stored state is the only authority for fee-tier
+  policy.
+
+### Stable error codes
+
+| Code | Name                  | Meaning                                                    |
+| ---- | --------------------- | ---------------------------------------------------------- |
+| 1    | `FeeTierNotAllowed`   | `create_pool` called with a tier not on the allowlist      |
+| 2    | `Unauthorized`        | Caller lacks the factory admin role for a privileged write |
+| 3    | `InvalidFeeTier`      | Fee tier is malformed or outside the valid range           |
+| 4    | `FeeTierAlreadySet`   | Enable/disable requested a state the tier is already in    |
+
+### Observability
+
+- Allowlist changes and rejected `create_pool` calls emit the stable error
+  code, the fee tier, and a per-request **correlation id** so ops can trace a
+  money-path decision.
+- Logs **never** include secrets, private keys, or full environment dumps;
+  only fee tiers, roles, and public identifiers are shown.
+
+### Rollout / rollback
+
+- The allowlist is additive and gated: it can be feature-flagged so the
+  allowlist check is enforced only when the flag is on, allowing a safe
+  rollout on testnet before mainnet.
+- Rollback: disable the flag (or re-enable previously allowed tiers) to
+  restore prior behavior; no on-chain state migration is required.
+
+## oracle-adapter: TWAP Window Configuration Bounds
+
+The `oracle-adapter` contract maintains a per-pool **TWAP window** used to
+price swaps, liquidity, and settlement. The window is a money-path
+configuration: an unbounded or malformed window lets a caller manipulate the
+average (too short → spot-price griefing; too long → stale pricing). The window
+is therefore **bounded**, **deny-by-default**, and **fail-closed**.
+
+### Entrypoints
+
+| Entrypoint             | Direction | Semantics                                                       |
+| ---------------------- | --------- | --------------------------------------------------------------- |
+| `set_twap_window`      | write     | Privileged: set the TWAP window for a pool (bounded)            |
+| `get_twap_window`      | read      | Return the configured TWAP window for a pool                    |
+| `twap`                 | read      | Return the TWAP over the configured window                      |
+
+### Configuration bounds
+
+- **Minimum window.** The window must be at least `MIN_TWAP_WINDOW`
+  (in seconds). A window below the minimum is rejected: it is too short to
+  resist spot-price manipulation.
+- **Maximum window.** The window must be at most `MAX_TWAP_WINDOW`
+  (in seconds). A window above the maximum is rejected: it would price against
+  stale observations.
+- **Valid interval.** The window must be an exact multiple of the oracle's
+  observation interval (`TWAP_INTERVAL`). A window that is not an integer
+  multiple of the interval is rejected, so the TWAP is always computed over a
+  whole number of observations.
+- **No implicit default.** A pool with no configured window has no TWAP; reads
+  fail closed rather than falling back to an unbounded or zero window.
+
+### Invariants
+
+- **Bounds are enforced on every write.** `set_twap_window` validates the
+  window against `MIN_TWAP_WINDOW`, `MAX_TWAP_WINDOW`, and `TWAP_INTERVAL`
+  before any state change. There is no path that stores an out-of-bounds
+  window.
+- **Deny-by-default.** A window that was never set, or that is out of bounds,
+  is not usable. `twap` fails closed instead of returning a spot price.
+- **Privileged writes are authorized.** `set_twap_window` requires the oracle
+  admin role; untrusted callers cannot change the window. Authorization is
+  checked before validation and before any state change.
+- **Idempotent admin writes.** Setting the window to its current value is a
+  no-op that does not corrupt state or emit a spurious change event.
+- **Contract is source of truth.** Callers cannot supply or override the
+  window; the adapter's stored state is the only authority for TWAP pricing.
+- **Existing pools are unaffected by bounds changes.** Tightening the bounds
+  does not retroactively invalidate a previously valid window; it gates new
+  writes only.
+
+### Stable error codes
+
+| Code | Name                    | Meaning                                                       |
+| ---- | ----------------------- | ------------------------------------------------------------- |
+| 1    | `TwapWindowTooShort`    | Window is below `MIN_TWAP_WINDOW`                             |
+| 2    | `TwapWindowTooLong`     | Window is above `MAX_TWAP_WINDOW`                             |
+| 3    | `TwapWindowNotAligned`  | Window is not an integer multiple of `TWAP_INTERVAL`          |
+| 4    | `TwapWindowUnset`       | `twap` read for a pool with no configured window              |
+| 5    | `Unauthorized`          | Caller lacks the oracle admin role for a privileged write    |
+| 6    | `TwapWindowAlreadySet`  | `set_twap_window` requested the window's current value        |
+
+### Observability
+
+- Window changes and rejected `set_twap_window` calls emit the stable error
+  code, the pool, the requested window, and a per-request **correlation id** so
+  ops can trace a money-path decision.
+- Logs **never** include secrets, private keys, or full environment dumps;
+  only pools, windows, roles, and public identifiers are shown.
+
+### Rollout / rollback
+
+- The bounds are additive and gated: they can be feature-flagged so the
+  bounds check is enforced only when the flag is on, allowing a safe rollout on
+  testnet before mainnet.
+- Rollback: disable the flag (or restore the previous bounds) to restore prior
+  behavior; no on-chain state migration is required.
+
+## pool: Initialize Authorization (frontrun-safe admin binding)
+
+The `pool` contract is deployed by `pool-factory` and initialized exactly once.
+Initialization binds the pool's **admin** and immutable configuration. Because
+initialization is a privileged, one-shot write on a money path, it is
+**deny-by-default** and **fail-closed**: an untrusted caller must never be able
+to frontrun `initialize` and seize the admin role.
+
+### Entrypoints
+
+| Entrypoint     | Direction | Semantics                              
