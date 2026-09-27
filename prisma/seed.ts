@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import { PrismaClient, Prisma } from '@prisma/client';
 
 const prisma = new PrismaClient();
@@ -39,6 +41,100 @@ class Spinner {
 }
 
 // ---------------------------------------------------------------------------
+// Deterministic fixture (fixtures/e2e-seed.json)
+// ---------------------------------------------------------------------------
+
+/**
+ * Shape of fixtures/e2e-seed.json. The file is validated in CI by
+ * `pnpm fixtures:check` (scripts/fixtures.js); see fixtures/README.md.
+ */
+export interface E2eSeedFixture {
+  version: 1;
+  network: 'testnet';
+  clock: { now: string };
+  tokens: Array<{
+    address: string;
+    symbol: string;
+    name: string;
+    decimals: number;
+    logoUri?: string;
+  }>;
+  pools: Array<{
+    id: string;
+    token0Address: string;
+    token1Address: string;
+    feeTier: number;
+    currentSqrtPrice: string;
+    currentTick: number;
+    liquidity: string;
+    tvl: string;
+    volume24h: string;
+    feeApr: string;
+    createdAt: string;
+  }>;
+  positions: Array<{
+    id: string;
+    poolId: string;
+    ownerAddress: string;
+    tokenId: string;
+    lowerTick: number;
+    upperTick: number;
+    liquidity: string;
+    feesCollected0: string;
+    feesCollected1: string;
+    createdAt: string;
+  }>;
+  swaps: Array<{
+    eventId: string;
+    poolId: string;
+    senderAddress: string;
+    recipientAddress: string;
+    amount0: string;
+    amount1: string;
+    sqrtPriceAfter: string;
+    tickAfter: number;
+    transactionHash: string;
+    timestamp: string;
+  }>;
+  priceCandles: Array<{
+    poolId: string;
+    interval: string;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volumeUsd: number;
+    periodStart: string;
+  }>;
+}
+
+export const E2E_SEED_PATH = path.resolve(__dirname, '../fixtures/e2e-seed.json');
+
+export function loadE2eSeedFixture(file: string = E2E_SEED_PATH): E2eSeedFixture {
+  const fixture = JSON.parse(fs.readFileSync(file, 'utf8')) as E2eSeedFixture;
+  if (fixture.version !== 1 || fixture.network !== 'testnet') {
+    throw new Error(
+      `SEED_FIXTURE_INVALID: ${file} must be version 1 on testnet (run \`pnpm fixtures:check\`)`
+    );
+  }
+  return fixture;
+}
+
+/**
+ * Kill-switch: the demo seed writes fake pools/positions/swaps, so it must never
+ * run against a production or mainnet database. Deny-by-default for those envs.
+ */
+export function assertSeedAllowed(env: NodeJS.ProcessEnv = process.env): void {
+  const nodeEnv = (env.NODE_ENV ?? '').toLowerCase();
+  const network = (env.STELLAR_NETWORK ?? '').toLowerCase();
+  if (nodeEnv === 'production' || network === 'mainnet' || network === 'public') {
+    throw new Error(
+      `SEED_REFUSED: refusing to seed demo fixtures (NODE_ENV=${nodeEnv || 'unset'}, ` +
+        `STELLAR_NETWORK=${network || 'unset'}). The seed is for local/testnet/e2e databases only.`
+    );
+  }
+}
+
 // Deterministic seed data — all values are fixed so re-runs are idempotent.
 //
 // Pool:    test-pool-1
@@ -58,107 +154,77 @@ export async function main() {
   const spinner = new Spinner();
 
   try {
+    assertSeedAllowed();
+    const fixture = loadE2eSeedFixture();
+
     // ── Tokens ──────────────────────────────────────────────────────────────
     spinner.start('Seeding tokens…');
-    const token0Data: Prisma.TokenCreateInput = {
-      address: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
-      symbol: 'USDC',
-      name: 'USD Coin',
-      decimals: 6,
-      logoUri: 'https://example.com/usdc.png',
-    };
-
-    const token0 = await prisma.token.upsert({
-      where: { address: token0Data.address },
-      update: {},
-      create: token0Data,
-    });
-
-    const token1Data: Prisma.TokenCreateInput = {
-      address: 'GBDEVU63Y6NTHJQQZIKVTC23NWLQVP3WJ2RI2OTSJTNYOIGICST6DUXR',
-      symbol: 'XLM',
-      name: 'Stellar Lumens',
-      decimals: 7,
-      logoUri: 'https://example.com/xlm.png',
-    };
-
-    const token1 = await prisma.token.upsert({
-      where: { address: token1Data.address },
-      update: {},
-      create: token1Data,
-    });
-    spinner.stop(true, `Tokens seeded  (${token0.symbol}, ${token1.symbol})`);
+    const tokens = [];
+    for (const tokenData of fixture.tokens) {
+      const data: Prisma.TokenCreateInput = { ...tokenData };
+      tokens.push(
+        await prisma.token.upsert({
+          where: { address: data.address },
+          update: {},
+          create: data,
+        })
+      );
+    }
+    spinner.stop(true, `Tokens seeded  (${tokens.map((t) => t.symbol).join(', ')})`);
 
     // ── Pool ────────────────────────────────────────────────────────────────
     spinner.start('Seeding pool…');
-    const poolData: Prisma.PoolCreateInput = {
-      id: 'test-pool-1',
-      token0Address: token0.address,
-      token1Address: token1.address,
-      feeTier: 3000,
-      currentSqrtPrice: SQRT_PRICE,
-      currentTick: 0,
-      liquidity: '1000000000000000000',
-      tvl: '2000000000',
-      volume24h: '100000000',
-      feeApr: '0.05',
-    };
-
-    const pool = await prisma.pool.upsert({
-      where: { id: poolData.id },
-      update: {},
-      create: poolData,
-    });
-    spinner.stop(true, `Pool seeded    (${pool.id})`);
+    const pools = [];
+    for (const { createdAt, ...rest } of fixture.pools) {
+      const poolData: Prisma.PoolCreateInput = { ...rest, createdAt: new Date(createdAt) };
+      pools.push(
+        await prisma.pool.upsert({
+          where: { id: poolData.id },
+          update: {},
+          create: poolData,
+        })
+      );
+    }
+    spinner.stop(true, `Pool seeded    (${pools.map((p) => p.id).join(', ')})`);
 
     // ── Position ────────────────────────────────────────────────────────────
     spinner.start('Seeding position…');
-    const positionData: Prisma.PositionCreateInput = {
-      id: 'test-position-1',
-      poolId: pool.id,
-      ownerAddress: DEMO_OWNER,
-      tokenId: '1',
-      lowerTick: -60,
-      upperTick: 60,
-      liquidity: '1000000000000000000',
-      feesCollected0: '0',
-      feesCollected1: '0',
-    };
+    for (const { createdAt, ...rest } of fixture.positions) {
+      // Unchecked input: poolId is set directly rather than via a relation connect.
+      const positionData: Prisma.PositionUncheckedCreateInput = {
+        ...rest,
+        createdAt: new Date(createdAt),
+      };
 
-    await prisma.position.upsert({
-      where: { id: positionData.id },
-      update: {},
-      create: positionData,
-    });
-    spinner.stop(true, 'Position seeded (test-position-1)');
+      await prisma.position.upsert({
+        where: { id: positionData.id },
+        update: {},
+        create: positionData,
+      });
+    }
+    spinner.stop(true, `Position seeded (${fixture.positions.map((p) => p.id).join(', ')})`);
 
     // ── Swaps ────────────────────────────────────────────────────────────────
     // Use upsert on eventId (unique) so re-runs are fully idempotent.
     spinner.start('Seeding swaps…');
-    const swapSeeds = [
-      {
-        eventId: 'seed-swap-event-1',
-        poolId: pool.id,
-        senderAddress: DEMO_OWNER,
-        recipientAddress: DEMO_OWNER,
-        amount0: '1000000',
-        amount1: '0',
-        sqrtPriceAfter: SQRT_PRICE,
-        tickAfter: 0,
-        transactionHash: 'seed-tx-1',
-      },
-      {
-        eventId: 'seed-swap-event-2',
-        poolId: pool.id,
-        senderAddress: DEMO_OWNER,
-        recipientAddress: DEMO_OWNER,
-        amount0: '0',
-        amount1: '10000000',
-        sqrtPriceAfter: SQRT_PRICE,
-        tickAfter: 0,
-        transactionHash: 'seed-tx-2',
-      },
-    ];
+    // eventId is the idempotency key; skipDuplicates make
+
+      await prisma.position.upsert({
+        where: { id: positionData.id },
+        update: {},
+        create: positionData,
+      });
+    }
+    spinner.stop(true, `Position seeded (${fixture.positions.map((p) => p.id).join(', ')})`);
+
+    // ── Swaps ────────────────────────────────────────────────────────────────
+    // Use upsert on eventId (unique) so re-runs are fully idempotent.
+    spinner.start('Seeding swaps…');
+    // eventId is the idempotency key; upsert makes re-runs a no-op.
+    const swapSeeds = fixture.swaps.map(({ timestamp, ...rest }) => ({
+      ...rest,
+      timestamp: new Date(timestamp),
+    }));
 
     for (const swap of swapSeeds) {
       await prisma.swap.upsert({
@@ -174,18 +240,13 @@ export async function main() {
     // idempotent. createMany + skipDuplicates only guards against the same
     // batch; upsert is safe across separate seed invocations.
     spinner.start('Seeding price candles…');
-    const candleSeeds = [
-      {
+    const candleSeeds = fixture.priceCandles.map(
+      ({ periodStart, ...rest }) => ({
+        ...rest,
         poolId: pool.id,
-        open: 1.0,
-        high: 1.05,
-        low: 0.95,
-        close: 1.02,
-        volumeUsd: 1000000.0,
-        periodStart: DEMO_CANDLE_START,
-        interval: '1h',
-      },
-    ];
+        periodStart: new Date(periodStart),
+      })
+    );
 
     for (const candle of candleSeeds) {
       await prisma.priceCandle.upsert({
