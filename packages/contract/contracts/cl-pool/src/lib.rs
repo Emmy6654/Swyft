@@ -1310,6 +1310,86 @@ mod tests {
         assert_eq!(get_amount_1_delta(p_high, p_low, 0, true), 0);
     }
 
+    #[test]
+    fn tick_bitmap_handles_signed_word_edges_and_round_trips() {
+        let env = Env::default();
+        let spacing = 60;
+        let edge_ticks = [-887_220, -7_680, -60, 0, 60, 7_680, 887_220];
+
+        for tick in edge_ticks {
+            let compressed = super::compressed_tick(tick, spacing);
+            let (_, bit) = super::tick_position(compressed);
+            assert!(bit < 128, "bitmap bit must stay within a u128 word");
+            super::flip_bitmap(&env, tick, spacing, true);
+        }
+
+        for window in edge_ticks.windows(2) {
+            let (next, found) =
+                super::next_initialized_tick(&env, window[0], spacing, false);
+            assert!(found, "bitmap must find the next initialized edge");
+            assert_eq!(next, window[1]);
+        }
+
+        super::flip_bitmap(&env, edge_ticks[0], spacing, true);
+        let (next, found) = super::next_initialized_tick(&env, edge_ticks[0], spacing, false);
+        assert!(found);
+        assert_eq!(next, edge_ticks[1]);
+
+        for tick in &edge_ticks[1..] {
+            super::flip_bitmap(&env, *tick, spacing, true);
+        }
+    }
+
+    #[test]
+    fn compressed_tick_uses_floor_division_for_negative_remainders() {
+        assert_eq!(super::compressed_tick(-1, 60), -1);
+        assert_eq!(super::compressed_tick(-59, 60), -1);
+        assert_eq!(super::compressed_tick(-60, 60), -1);
+        assert_eq!(super::compressed_tick(0, 60), 0);
+        assert_eq!(super::compressed_tick(59, 60), 0);
+        assert_eq!(super::compressed_tick(60, 60), 1);
+    }
+
+    #[test]
+    fn liquidity_add_remove_round_trip_stays_within_rounding_bounds() {
+        let (env, pool_id, token_0, token_1, lp, _swapper) = setup();
+        let pool = ClPoolClient::new(&env, &pool_id);
+        let token_0_client = token::Client::new(&env, &token_0);
+        let token_1_client = token::Client::new(&env, &token_1);
+        let cases = [
+            (-600, 600, 1u128),
+            (-600, 600, 10_000u128),
+            (-600, 600, 1_000_000u128),
+            (-600, 600, 1_000_000_000_000u128),
+            (-600, 0, 10_000u128),
+            (0, 600, 10_000u128),
+        ];
+
+        for (position_id, (lower, upper, liquidity)) in cases.into_iter().enumerate() {
+            let before_0 = token_0_client.balance(&lp) as u128;
+            let before_1 = token_1_client.balance(&lp) as u128;
+            pool.add_liquidity(&lp, &lower, &upper, &liquidity);
+            let deposited_0 = before_0 - token_0_client.balance(&lp) as u128;
+            let deposited_1 = before_1 - token_1_client.balance(&lp) as u128;
+
+            let (returned_0, returned_1) =
+                pool.remove_liquidity(&lp, &(position_id as u64), &liquidity);
+
+            assert!(
+                deposited_0 - returned_0 <= 1,
+                "token0 round-trip exceeded one-unit rounding loss"
+            );
+            assert!(
+                deposited_1 - returned_1 <= 1,
+                "token1 round-trip exceeded one-unit rounding loss"
+            );
+            assert_eq!(pool.get_position(&(position_id as u64)), None);
+        }
+
+        assert_eq!(token_0_client.balance(&pool_id), 0);
+        assert_eq!(token_1_client.balance(&pool_id), 0);
+    }
+
     // ── Tick crossing in swap ───────────────────────────────────────────────
 
     #[test]
