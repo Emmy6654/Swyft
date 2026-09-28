@@ -9,6 +9,17 @@ const mockSignTransaction = vi.fn();
 vi.mock('@stellar/freighter-api', () => ({
   signTransaction: (...args: unknown[]) => mockSignTransaction(...args),
 }));
+vi.mock('@/context/WalletContext', () => ({
+  useWalletContext: () => ({
+    signTransaction: async (xdr: string) => {
+      const result = await mockSignTransaction(xdr);
+      if (typeof result === 'string') return result;
+      return result && typeof result === 'object' && 'signedTxXdr' in result
+        ? result.signedTxXdr
+        : null;
+    },
+  }),
+}));
 
 const mockBuildSwapTx = vi.fn();
 const mockBuildExactOutputSwapTx = vi.fn();
@@ -21,14 +32,23 @@ vi.mock('@swyft/sdk', async () => {
   };
 });
 
-const mockReportTx = vi.fn();
+const mockTransactionStatus = vi.hoisted(() => ({
+  reportTx: vi.fn(),
+  pendingTx: null as {
+    status: string;
+    txHash: string;
+    errorCode?: string;
+    errorMessage?: string;
+  } | null,
+}));
 vi.mock('@/context/TransactionStatusContext', () => ({
-  useTransactionStatus: () => ({ reportTx: mockReportTx }),
+  useTransactionStatus: () => mockTransactionStatus,
 }));
 
 vi.mock('@/context/NetworkContext', () => ({
-  useNetworkContext: () => ({ network: 'TESTNET' }),
+  useNetworkContext: () => ({ network: 'TESTNET', apiBase: 'http://localhost:3001/v1' }),
 }));
+vi.mock('@/lib/auth', () => ({ getAuthToken: () => 'test-token' }));
 
 vi.mock('@/lib/constants', () => ({
   API_BASE: 'http://localhost:3001/v1',
@@ -44,6 +64,7 @@ const mevState: { enabled: boolean; mevRpcUrl: string | undefined } = {
   mevRpcUrl: undefined,
 };
 vi.mock('./useMevProtection', () => ({
+  isValidRpcUrl: (value: string | undefined) => Boolean(value && value.startsWith('https://')),
   useMevProtection: () => ({
     enabled: mevState.enabled,
     available: mevState.mevRpcUrl !== undefined,
@@ -59,14 +80,16 @@ const MEV_RPC_URL = 'https://mev-rpc.example.com';
 
 /** Mocks a single successful Soroban `sendTransaction` JSON-RPC response. */
 function mockRpcSendTransactionOnce(hash: string) {
-  global.fetch = vi.fn().mockResolvedValue({
-    ok: true,
-    json: async () => ({
-      jsonrpc: '2.0',
-      id: 1,
-      result: { status: 'PENDING', hash },
-    }),
-  }) as unknown as typeof fetch;
+  global.fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ jsonrpc: '2.0', id: 1, result: { status: 'PENDING', hash } }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ jsonrpc: '2.0', id: 1, result: { status: 'SUCCESS' } }),
+    }) as unknown as typeof fetch;
 }
 
 const tokenIn: Token = { id: 'CTOKENIN', symbol: 'USDC', name: 'USD Coin', logoUrl: null };
@@ -84,13 +107,19 @@ const quote: SwapQuote = {
 function mockFetchOnce(response: Partial<Response> & { json: () => Promise<unknown> }) {
   global.fetch = vi.fn().mockResolvedValue({
     ok: true,
-    json: response.json,
     ...response,
+    json: async () => {
+      const body = await response.json();
+      return body !== null && typeof body === 'object' && 'hash' in body
+        ? { successful: true, ...body }
+        : body;
+    },
   }) as unknown as typeof fetch;
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockTransactionStatus.pendingTx = null;
   mockBuildSwapTx.mockReturnValue({ xdr: 'unsigned-xdr', type: 'swap' });
   mockBuildExactOutputSwapTx.mockReturnValue({ xdr: 'unsigned-exact-out-xdr', type: 'swap' });
   mevState.enabled = false;
@@ -136,10 +165,7 @@ describe('useSwapExecution — exact-input signing and submission', () => {
         ownerAddress: 'GWALLET',
       })
     );
-    expect(mockSignTransaction).toHaveBeenCalledWith(
-      'unsigned-xdr',
-      expect.objectContaining({ networkPassphrase: expect.any(String) })
-    );
+    expect(mockSignTransaction).toHaveBeenCalledWith('unsigned-xdr');
     expect(global.fetch).toHaveBeenCalledWith(
       expect.stringContaining('/transactions'),
       expect.objectContaining({
@@ -339,9 +365,41 @@ describe('useSwapExecution — exact-input signing and submission', () => {
     });
 
     await waitFor(() => expect(result.current.status).toBe('success'));
-    expect(mockReportTx).toHaveBeenCalledWith(
+    expect(mockTransactionStatus.reportTx).toHaveBeenCalledWith(
       expect.objectContaining({ status: 'success', txHash: 'abc123' })
     );
+  });
+
+  it('moves to failed when the ledger rejects an accepted MEV transaction', async () => {
+    mevState.enabled = true;
+    mevState.mevRpcUrl = MEV_RPC_URL;
+    mockSignTransaction.mockResolvedValue('signed-xdr');
+    mockRpcSendTransactionOnce('mev-failed-hash');
+
+    const { result, rerender } = renderHook(() => useSwapExecution());
+
+    await act(async () => {
+      await result.current.execute({
+        poolId: 'CPOOL',
+        tokenIn,
+        tokenOut,
+        amountIn: '100',
+        quote,
+        walletAddress: 'GWALLET',
+      });
+    });
+    await waitFor(() => expect(result.current.status).toBe('pending'));
+
+    mockTransactionStatus.pendingTx = {
+      status: 'error',
+      txHash: 'mev-failed-hash',
+      errorCode: 'TX_FAILED',
+      errorMessage: 'Transaction failed on-ledger',
+    };
+    rerender();
+
+    await waitFor(() => expect(result.current.status).toBe('error'));
+    expect(result.current.error).toBe('failed');
   });
 });
 
@@ -380,10 +438,7 @@ describe('useSwapExecution — exact-output signing and submission', () => {
         ownerAddress: 'GWALLET',
       })
     );
-    expect(mockSignTransaction).toHaveBeenCalledWith(
-      'unsigned-exact-out-xdr',
-      expect.objectContaining({ networkPassphrase: expect.any(String) })
-    );
+    expect(mockSignTransaction).toHaveBeenCalledWith('unsigned-exact-out-xdr');
 
     await waitFor(() => expect(result.current.status).toBe('success'));
     expect(result.current.txHash).toBe('exact-out-hash');
@@ -397,7 +452,7 @@ describe('useSwapExecution — MEV-protected routing (exact-input)', () => {
     mockSignTransaction.mockResolvedValue('signed-xdr');
     mockRpcSendTransactionOnce('mev-hash-1');
 
-    const { result } = renderHook(() => useSwapExecution());
+    const { result, rerender } = renderHook(() => useSwapExecution());
 
     await act(async () => {
       await result.current.execute({
@@ -422,8 +477,12 @@ describe('useSwapExecution — MEV-protected routing (exact-input)', () => {
       expect.anything()
     );
 
-    await waitFor(() => expect(result.current.status).toBe('success'));
+    await waitFor(() => expect(result.current.status).toBe('pending'));
     expect(result.current.txHash).toBe('mev-hash-1');
+
+    mockTransactionStatus.pendingTx = { status: 'success', txHash: 'mev-hash-1' };
+    rerender();
+    await waitFor(() => expect(result.current.status).toBe('success'));
   });
 
   it('still uses POST /transactions when MEV protection is disabled', async () => {
@@ -519,7 +578,7 @@ describe('useSwapExecution — MEV-protected routing (exact-output)', () => {
       expect.anything()
     );
 
-    await waitFor(() => expect(result.current.status).toBe('success'));
+    await waitFor(() => expect(result.current.status).toBe('pending'));
     expect(result.current.txHash).toBe('mev-hash-2');
   });
 
