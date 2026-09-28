@@ -374,7 +374,9 @@ export function useAddLiquidity() {
     const hasVolumeData =
       typeof state.pool.volume24h === 'number' && !Number.isNaN(state.pool.volume24h);
     const hasFeeAprData =
-      typeof state.pool.feeApr === 'number' && !Number.isNaN(state.pool.feeApr);
+      typeof state.pool.feeApr === 'number' &&
+      Number.isFinite(state.pool.feeApr) &&
+      state.pool.feeApr >= 0;
 
     let estimatedApr: string;
     if (!hasVolumeData || !hasFeeAprData) {
