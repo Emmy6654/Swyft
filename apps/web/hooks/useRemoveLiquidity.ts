@@ -3,12 +3,13 @@
 import { useState } from 'react';
 import { buildBurnTx, buildCollectTx } from '@swyft/sdk';
 import type { PositionSnapshot } from '@swyft/ui';
-import { API_BASE } from '@/lib/constants';
+import { useNetworkContext } from '@/context/NetworkContext';
+import { useTransactionStatus } from '@/context/TransactionStatusContext';
 
 /** Lifecycle status of a remove-liquidity or collect-fees transaction. */
 export type TxStatus = 'idle' | 'signing' | 'submitting' | 'success' | 'error';
 /** Reason a transaction failed. */
-export type TxError = 'rejected' | 'network' | 'already_closed' | null;
+export type TxError = 'rejected' | 'network' | 'failed' | 'already_closed' | null;
 
 interface State {
   status: TxStatus;
@@ -23,8 +24,8 @@ interface State {
  * @returns The transaction hash on success.
  * @throws {Error} "already_closed" if the position is already closed, "network" for other failures.
  */
-async function submitXdr(xdr: string, authToken: string): Promise<string> {
-  const res = await fetch(`${API_BASE}/transactions`, {
+async function submitXdr(xdr: string, authToken: string, apiBase: string): Promise<string> {
+  const res = await fetch(`${apiBase}/transactions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
     body: JSON.stringify({ xdr }),
@@ -34,7 +35,10 @@ async function submitXdr(xdr: string, authToken: string): Promise<string> {
     if (body.code === 'POSITION_CLOSED') throw new Error('already_closed');
     throw new Error('network');
   }
-  const data = (await res.json()) as { hash: string };
+  const data = (await res.json()) as { hash: string; successful?: boolean };
+  if (data.successful !== true) {
+    throw new Error(data.successful === false ? 'failed' : 'network');
+  }
   return data.hash;
 }
 
@@ -58,6 +62,8 @@ export function useRemoveLiquidity(
   signXdr?: ((xdr: string) => Promise<string>) | null
 ) {
   const [state, setState] = useState<State>({ status: 'idle', txError: null, txHash: null });
+  const { apiBase, network } = useNetworkContext();
+  const { reportTx } = useTransactionStatus();
 
   /** Resets transaction state back to idle. */
   function reset() {
@@ -79,6 +85,7 @@ export function useRemoveLiquidity(
     }
 
     setState({ status: 'signing', txError: null, txHash: null });
+    reportTx({ label: 'Remove liquidity', status: 'signing', txHash: null, network });
 
     try {
       const { xdr } = buildBurnTx({
@@ -101,21 +108,39 @@ export function useRemoveLiquidity(
 
       if (!signedXdr) {
         setState({ status: 'error', txError: 'rejected', txHash: null });
+        reportTx({
+          label: 'Remove liquidity',
+          status: 'error',
+          txHash: null,
+          errorMessage: 'Transaction signature was rejected',
+          network,
+        });
         return;
       }
 
       setState((s) => ({ ...s, status: 'submitting' }));
-      const hash = await submitXdr(signedXdr, authToken);
+      reportTx({ label: 'Remove liquidity', status: 'submitting', txHash: null, network });
+      const hash = await submitXdr(signedXdr, authToken, apiBase);
       setState({ status: 'success', txError: null, txHash: hash });
+      reportTx({ label: 'Remove liquidity', status: 'success', txHash: hash, network });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : '';
       const txError: TxError =
         msg === 'already_closed'
           ? 'already_closed'
-          : msg.includes('reject') || msg.includes('cancel')
+          : msg === 'failed'
+            ? 'failed'
+            : msg.includes('reject') || msg.includes('cancel')
             ? 'rejected'
             : 'network';
       setState({ status: 'error', txError, txHash: null });
+      reportTx({
+        label: 'Remove liquidity',
+        status: 'error',
+        txHash: null,
+        errorMessage: msg || 'Transaction failed',
+        network,
+      });
     }
   }
 
@@ -131,6 +156,7 @@ export function useRemoveLiquidity(
     }
 
     setState({ status: 'signing', txError: null, txHash: null });
+    reportTx({ label: 'Collect fees', status: 'signing', txHash: null, network });
 
     try {
       const { xdr } = buildCollectTx({
@@ -150,21 +176,39 @@ export function useRemoveLiquidity(
 
       if (!signedXdr) {
         setState({ status: 'error', txError: 'rejected', txHash: null });
+        reportTx({
+          label: 'Collect fees',
+          status: 'error',
+          txHash: null,
+          errorMessage: 'Transaction signature was rejected',
+          network,
+        });
         return;
       }
 
       setState((s) => ({ ...s, status: 'submitting' }));
-      const hash = await submitXdr(signedXdr, authToken);
+      reportTx({ label: 'Collect fees', status: 'submitting', txHash: null, network });
+      const hash = await submitXdr(signedXdr, authToken, apiBase);
       setState({ status: 'success', txError: null, txHash: hash });
+      reportTx({ label: 'Collect fees', status: 'success', txHash: hash, network });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : '';
       const txError: TxError =
         msg === 'already_closed'
           ? 'already_closed'
-          : msg.includes('reject') || msg.includes('cancel')
+          : msg === 'failed'
+            ? 'failed'
+            : msg.includes('reject') || msg.includes('cancel')
             ? 'rejected'
             : 'network';
       setState({ status: 'error', txError, txHash: null });
+      reportTx({
+        label: 'Collect fees',
+        status: 'error',
+        txHash: null,
+        errorMessage: msg || 'Transaction failed',
+        network,
+      });
     }
   }
 
