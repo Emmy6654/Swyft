@@ -112,6 +112,7 @@ caught whenever changes land in `apps/web`.
 - Issues labelled [`good first issue`](https://github.com/Vatix-Protocol/Swyft/issues?q=label%3A%22good+first+issue%22) are well-scoped and don't require deep protocol knowledge
 - Issues labelled [`bounty`](https://github.com/Vatix-Protocol/Swyft/issues?q=label%3Abounty) have a financial reward attached
 - Comment on an issue before starting work to avoid duplication
+- Stellar Wave issues follow the [labeling policy](docs/STELLAR_WAVE_LABELING_POLICY.md); confirm the area and risk labels before starting work
 
 ---
 

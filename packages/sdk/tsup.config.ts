@@ -13,6 +13,7 @@ const entry = {
   swap: 'src/swap.ts',
   types: 'src/types.ts',
   config: 'src/config.ts',
+  errors: 'src/errors.ts',
 };
 
 export default defineConfig([

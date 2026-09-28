@@ -236,6 +236,13 @@ The package sets `"sideEffects": false` and ships separate `browser` / `import`
 Vite, esbuild, Next.js/Turbopack) and Node (both `require` and native `import`)
 each resolve the correct build automatically — no manual configuration needed.
 
+CI runs `pnpm --filter @swyft/sdk size:check` after every SDK build. The check
+fails when an ESM entrypoint exceeds its raw or gzip budget, making an
+accidental dependency import visible before release. Budgets are intentionally
+per-entrypoint so a small `@swyft/sdk/swap` import is not judged against the
+full root barrel. Update the budget and explain the dependency/size tradeoff in
+the same reviewed change when a deliberate increase is required.
+
 ---
 
 ## Advanced: On-chain Quote Simulation

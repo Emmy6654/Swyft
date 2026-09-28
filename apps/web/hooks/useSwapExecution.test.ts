@@ -9,6 +9,18 @@ const mockSignTransaction = vi.fn();
 vi.mock('@stellar/freighter-api', () => ({
   signTransaction: (...args: unknown[]) => mockSignTransaction(...args),
 }));
+vi.mock('@/context/WalletContext', () => ({
+  useWalletContext: () => ({
+    signTransaction: async (...args: unknown[]) => {
+      const result = await mockSignTransaction(...args);
+      if (typeof result === 'string') return result;
+      if (result && typeof result === 'object' && 'signedTxXdr' in result) {
+        return result.signedTxXdr;
+      }
+      throw new Error('Signing rejected');
+    },
+  }),
+}));
 
 const mockBuildSwapTx = vi.fn();
 const mockBuildExactOutputSwapTx = vi.fn();
@@ -45,6 +57,7 @@ const mevState: { enabled: boolean; mevRpcUrl: string | undefined } = {
   mevRpcUrl: undefined,
 };
 vi.mock('./useMevProtection', () => ({
+  isValidRpcUrl: (url: string | undefined) => Boolean(url),
   useMevProtection: () => ({
     enabled: mevState.enabled,
     available: mevState.mevRpcUrl !== undefined,
@@ -138,8 +151,7 @@ describe('useSwapExecution — exact-input signing and submission', () => {
       })
     );
     expect(mockSignTransaction).toHaveBeenCalledWith(
-      'unsigned-xdr',
-      expect.objectContaining({ networkPassphrase: expect.any(String) })
+      'unsigned-xdr'
     );
     expect(global.fetch).toHaveBeenCalledWith(
       'https://testnet-api.example/v1/transactions',
@@ -179,7 +191,7 @@ describe('useSwapExecution — exact-input signing and submission', () => {
     expect(result.current.txHash).toBe('hash2');
   });
 
-  it('silently returns to idle when the wallet rejects the signature (no signedTxXdr)', async () => {
+  it('shows an explicit rejection when the wallet returns no signed transaction', async () => {
     mockSignTransaction.mockResolvedValue({ notSigned: true });
 
     const { result } = renderHook(() => useSwapExecution());
@@ -195,11 +207,13 @@ describe('useSwapExecution — exact-input signing and submission', () => {
       });
     });
 
-    expect(result.current.status).toBe('idle');
+    expect(result.current.status).toBe('error');
+    expect(result.current.error).toBe('rejected');
+    expect(result.current.detail).toContain('Nothing was submitted');
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
-  it('sets status to idle when signing throws a rejection-style error', async () => {
+  it('shows an explicit rejection when signing throws a rejection-style error', async () => {
     mockSignTransaction.mockRejectedValue(new Error('User rejected access'));
 
     const { result } = renderHook(() => useSwapExecution());
@@ -215,8 +229,9 @@ describe('useSwapExecution — exact-input signing and submission', () => {
       });
     });
 
-    expect(result.current.status).toBe('idle');
-    expect(result.current.error).toBeNull();
+    expect(result.current.status).toBe('error');
+    expect(result.current.error).toBe('rejected');
+    expect(result.current.detail).toContain('Nothing was submitted');
   });
 
   it('surfaces a network error when signing throws a non-rejection error', async () => {
@@ -382,8 +397,7 @@ describe('useSwapExecution — exact-output signing and submission', () => {
       })
     );
     expect(mockSignTransaction).toHaveBeenCalledWith(
-      'unsigned-exact-out-xdr',
-      expect.objectContaining({ networkPassphrase: expect.any(String) })
+      'unsigned-exact-out-xdr'
     );
 
     await waitFor(() => expect(result.current.status).toBe('success'));
