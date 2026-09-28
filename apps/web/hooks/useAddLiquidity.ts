@@ -7,6 +7,7 @@ import { getAuthToken } from '@/lib/auth';
 import { useTransactionStatus } from '@/context/TransactionStatusContext';
 import { MevSubmissionError, submitTransaction } from '@/lib/mev-submission';
 import { useNetworkContext } from '@/context/NetworkContext';
+import { isWalletRejection } from '@/lib/wallet-errors';
 
 const TICK_BASE = 1.0001;
 const MIN_TICK = -887272;
@@ -303,9 +304,8 @@ export function useAddLiquidity() {
         // Route through the wallet-context signer so Freighter and xBull
         // both work without this hook knowing which wallet is active.
         const signedXdr = await signXdr(xdr).catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : '';
-          if (msg.includes('reject') || msg.includes('cancel') || msg.includes('denied')) {
-            return null; // user rejected
+          if (isWalletRejection(err)) {
+            return null;
           }
           throw err;
         });
@@ -358,12 +358,11 @@ export function useAddLiquidity() {
         setState((s) => ({
           ...s,
           txStatus: 'error',
-          txError:
-            msg.toLowerCase().includes('reject') || msg.toLowerCase().includes('cancel')
-              ? 'rejected'
-              : e instanceof MevSubmissionError && e.code === 'TX_FAILED'
-                ? 'failed'
-                : 'network',
+          txError: isWalletRejection(e)
+            ? 'rejected'
+            : e instanceof MevSubmissionError && e.code === 'TX_FAILED'
+              ? 'failed'
+              : 'network',
         }));
       }
     },

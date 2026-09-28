@@ -5,6 +5,8 @@ import { buildRerangeTx } from '@swyft/sdk';
 import type { PositionSnapshot } from '@swyft/ui';
 import { useNetworkContext } from '@/context/NetworkContext';
 import { useTransactionStatus } from '@/context/TransactionStatusContext';
+import { API_BASE } from '@/lib/constants';
+import { isWalletRejection } from '@/lib/wallet-errors';
 
 /** Lifecycle status of a rerange transaction. */
 export type TxStatus = 'idle' | 'signing' | 'submitting' | 'success' | 'error';
@@ -99,8 +101,7 @@ export function useRerangeLiquidity(
       // Route through the wallet-context signer so Freighter and xBull
       // both work without this hook knowing which wallet is active.
       const signedXdr = await signXdr(xdr).catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : '';
-        if (msg.includes('reject') || msg.includes('cancel') || msg.includes('denied')) {
+        if (isWalletRejection(err)) {
           return null;
         }
         throw err;
@@ -124,13 +125,8 @@ export function useRerangeLiquidity(
       setState({ status: 'success', txError: null, txHash: hash });
       reportTx({ label: 'Rerange liquidity', status: 'success', txHash: hash, network });
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : '';
       const txError: TxError =
-        msg === 'failed'
-          ? 'failed'
-          : msg.includes('reject') || msg.includes('cancel')
-            ? 'rejected'
-            : 'network';
+        isWalletRejection(e) ? 'rejected' : 'network';
       setState({ status: 'error', txError, txHash: null });
       reportTx({
         label: 'Rerange liquidity',
